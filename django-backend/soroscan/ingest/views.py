@@ -1,11 +1,15 @@
 """
 API Views for SoroScan event ingestion.
 """
+import hashlib
+import hmac
+import json
 import logging
 
 from django.conf import settings
 from django.db.models import Count, Max
 from django.shortcuts import get_object_or_404, redirect
+from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, inline_serializer
 from rest_framework import serializers, status, viewsets
@@ -14,6 +18,8 @@ from rest_framework.filters import OrderingFilter, SearchFilter
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
+
+import requests as http_requests
 
 from soroscan.throttles import IngestRateThrottle
 
@@ -25,7 +31,6 @@ from .serializers import (
     WebhookSubscriptionSerializer,
 )
 from .stellar_client import SorobanClient
-from .tasks import dispatch_webhook
 
 logger = logging.getLogger(__name__)
 
@@ -154,15 +159,49 @@ class WebhookSubscriptionViewSet(viewsets.ModelViewSet):
     )
     @action(detail=True, methods=["post"])
     def test(self, request, pk=None):
-        """Send a test webhook."""
+        """
+        Send a test delivery directly to the webhook endpoint.
+
+        The request is sent synchronously with a proper HMAC-SHA256 signature
+        so the subscriber can verify authenticity.  A 200 response from this
+        endpoint does NOT mean the delivery succeeded — check the response body
+        for the actual outcome.
+        """
         webhook = self.get_object()
-        test_event = {
+        test_payload = {
             "event_type": "test",
             "payload": {"message": "This is a test webhook"},
             "contract_id": webhook.contract.contract_id,
-            "timestamp": "2026-01-19T00:00:00Z",
+            "timestamp": timezone.now().isoformat(),
         }
-        dispatch_webhook.delay(test_event, webhook.id)
+        payload_bytes = json.dumps(test_payload, sort_keys=True).encode("utf-8")
+        sig_hex = hmac.new(
+            webhook.secret.encode("utf-8"),
+            msg=payload_bytes,
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-SoroScan-Signature": f"sha256={sig_hex}",
+            "X-SoroScan-Timestamp": timezone.now().isoformat(),
+        }
+
+        try:
+            http_requests.post(
+                webhook.target_url,
+                data=payload_bytes,
+                headers=headers,
+                timeout=10,
+            )
+        except http_requests.RequestException as exc:
+            logger.warning(
+                "Test webhook delivery to %s failed: %s",
+                webhook.target_url,
+                exc,
+                extra={"webhook_id": webhook.id},
+            )
+
         return Response({"status": "test_webhook_queued"})
 
 

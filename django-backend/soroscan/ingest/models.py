@@ -165,6 +165,13 @@ class WebhookSubscription(models.Model):
     Webhook subscriptions for push notifications on specific events.
     """
 
+    STATUS_ACTIVE = "active"
+    STATUS_SUSPENDED = "suspended"
+    STATUS_CHOICES = [
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_SUSPENDED, "Suspended"),
+    ]
+
     contract = models.ForeignKey(
         TrackedContract,
         on_delete=models.CASCADE,
@@ -179,9 +186,16 @@ class WebhookSubscription(models.Model):
     target_url = models.URLField(help_text="URL to POST event data to")
     secret = models.CharField(
         max_length=64,
-        help_text="Secret for HMAC signature verification",
+        help_text="HMAC secret — stored as a hex token, never logged or exposed via API",
     )
     is_active = models.BooleanField(default=True)
+    status = models.CharField(
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default=STATUS_ACTIVE,
+        db_index=True,
+        help_text="Lifecycle state: active dispatches events; suspended has exhausted all retries",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     last_triggered = models.DateTimeField(null=True, blank=True)
     failure_count = models.PositiveIntegerField(default=0)
@@ -197,6 +211,63 @@ class WebhookSubscription(models.Model):
         if not self.secret:
             self.secret = secrets.token_hex(32)
         super().save(*args, **kwargs)
+
+
+class WebhookDeliveryLog(models.Model):
+    """
+    Immutable audit log for every webhook dispatch attempt.
+
+    Records are subject to a 30-day TTL: the ``cleanup_webhook_delivery_logs``
+    Celery task (scheduled via Celery Beat) prunes entries older than 30 days.
+    """
+
+    subscription = models.ForeignKey(
+        WebhookSubscription,
+        on_delete=models.CASCADE,
+        related_name="delivery_logs",
+        help_text="Subscription this attempt belongs to",
+    )
+    event = models.ForeignKey(
+        "ContractEvent",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="delivery_logs",
+        help_text="ContractEvent that triggered this delivery",
+    )
+    attempt_number = models.PositiveIntegerField(
+        default=1,
+        help_text="1-based attempt counter (1 = first try, 2 = first retry, …)",
+    )
+    status_code = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="HTTP status code returned by the subscriber, or null for network errors",
+    )
+    success = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="True when subscriber returned a 2xx response",
+    )
+    error = models.TextField(
+        blank=True,
+        help_text="Error detail when success=False",
+    )
+    timestamp = models.DateTimeField(
+        auto_now_add=True,
+        db_index=True,
+        help_text="UTC timestamp of this attempt",
+    )
+
+    class Meta:
+        ordering = ["-timestamp"]
+        indexes = [
+            models.Index(fields=["subscription", "timestamp"]),
+        ]
+
+    def __str__(self):
+        status_label = "OK" if self.success else f"FAIL({self.status_code})"
+        return f"Delivery #{self.attempt_number} [{status_label}] sub={self.subscription_id}"
 
 
 class IndexerState(models.Model):

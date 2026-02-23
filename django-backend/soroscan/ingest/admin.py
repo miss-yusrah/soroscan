@@ -7,7 +7,7 @@ from django.contrib.admin.helpers import ActionForm
 from django.db.models import Count
 from django.utils.html import format_html
 
-from .models import ContractEvent, IndexerState, TrackedContract, WebhookSubscription, EventSchema
+from .models import ContractEvent, IndexerState, TrackedContract, WebhookDeliveryLog, WebhookSubscription, EventSchema
 from .tasks import backfill_contract_events
 
 
@@ -251,13 +251,14 @@ class WebhookSubscriptionAdmin(admin.ModelAdmin):
         "target_url",
         "contract_name",
         "event_type_display",
+        "status",
         "is_active_display",
         "failure_count",
         "last_delivery_status",
     ]
-    list_filter = ["is_active", "contract", "created_at"]
+    list_filter = ["is_active", "status", "contract", "created_at"]
     search_fields = ["target_url", "contract__name", "event_type"]
-    readonly_fields = ["secret", "created_at", "last_triggered", "failure_count"]
+    readonly_fields = ["secret", "created_at", "last_triggered", "failure_count", "status"]
     ordering = ["-created_at"]
 
     def get_queryset(self, request):
@@ -307,3 +308,67 @@ class WebhookSubscriptionAdmin(admin.ModelAdmin):
 class IndexerStateAdmin(admin.ModelAdmin):
     list_display = ["key", "value", "updated_at"]
     readonly_fields = ["updated_at"]
+
+
+@admin.register(WebhookDeliveryLog)
+class WebhookDeliveryLogAdmin(admin.ModelAdmin):
+    """
+    Read-only audit log of every webhook delivery attempt.
+
+    Records are pruned after 30 days by the ``cleanup_webhook_delivery_logs``
+    Celery task.  Manual editing is intentionally disabled.
+    """
+
+    list_display = [
+        "id",
+        "subscription_url",
+        "attempt_number",
+        "status_code_display",
+        "success_display",
+        "timestamp",
+    ]
+    list_filter = ["success", "timestamp"]
+    search_fields = ["subscription__target_url", "error"]
+    readonly_fields = [
+        "subscription",
+        "event",
+        "attempt_number",
+        "status_code",
+        "success",
+        "error",
+        "timestamp",
+    ]
+    ordering = ["-timestamp"]
+    date_hierarchy = "timestamp"
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related("subscription", "event")
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    @admin.display(description="Target URL")
+    def subscription_url(self, obj):
+        return obj.subscription.target_url
+
+    @admin.display(description="Status Code")
+    def status_code_display(self, obj):
+        if obj.status_code is None:
+            return format_html('<span style="color: #6c757d;">—</span>')
+        if 200 <= obj.status_code < 300:
+            color = "#28a745"
+        elif obj.status_code == 429:
+            color = "#ffc107"
+        else:
+            color = "#dc3545"
+        return format_html('<span style="color: {};">{}</span>', color, obj.status_code)
+
+    @admin.display(description="Success", boolean=True)
+    def success_display(self, obj):
+        return obj.success

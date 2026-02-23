@@ -6,6 +6,7 @@ from soroscan.ingest.models import (
     ContractEvent,
     EventSchema,
     TrackedContract,
+    WebhookDeliveryLog,
     WebhookSubscription,
 )
 
@@ -54,6 +55,7 @@ class ContractEventFactory(DjangoModelFactory):
     payload = {"amount": 100, "from": "Alice", "to": "Bob"}
     payload_hash = factory.Sequence(lambda n: f"{'a' * 64}")
     ledger = factory.Sequence(lambda n: 1000 + n)
+    event_index = factory.Sequence(lambda n: n)
     timestamp = factory.Faker("date_time")
     tx_hash = factory.Sequence(lambda n: f"{'b' * 64}")
 
@@ -67,3 +69,16 @@ class WebhookSubscriptionFactory(DjangoModelFactory):
     target_url = "https://example.com/webhook"
     secret = factory.Sequence(lambda n: f"secret_{n}")
     is_active = True
+    status = WebhookSubscription.STATUS_ACTIVE
+
+
+class WebhookDeliveryLogFactory(DjangoModelFactory):
+    class Meta:
+        model = WebhookDeliveryLog
+
+    subscription = factory.SubFactory(WebhookSubscriptionFactory)
+    event = factory.SubFactory(ContractEventFactory)
+    attempt_number = 1
+    status_code = 200
+    success = True
+    error = ""

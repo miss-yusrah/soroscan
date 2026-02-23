@@ -3,13 +3,15 @@ Celery tasks for SoroScan background processing.
 """
 import hashlib
 import hmac
+import json
 import logging
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any
 
 import jsonschema
 import requests
 from celery import shared_task
+from django.db.models import F
 from django.utils import timezone
 
 from .models import ContractEvent, TrackedContract, WebhookSubscription, IndexerState, EventSchema
@@ -124,89 +126,244 @@ def validate_event_payload(
         return (False, schema.version)
 
 
-@shared_task(bind=True, max_retries=3, default_retry_delay=60)
-def dispatch_webhook(self, event_data: dict[str, Any], webhook_id: int) -> bool:
+@shared_task(
+    bind=True,
+    autoretry_for=(requests.exceptions.RequestException,),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    max_retries=5,
+)
+def dispatch_webhook(self, subscription_id: int, event_id: int) -> bool:
     """
-    Send event data to a webhook subscriber.
+    Deliver a single ContractEvent to a WebhookSubscription endpoint.
+
+    Retry strategy
+    ~~~~~~~~~~~~~~
+    Celery auto-retries on any ``requests.RequestException`` with exponential
+    backoff (cap 600 s, up to 5 retries).  On HTTP 429 the ``Retry-After``
+    response header is honoured.  Every attempt — success or failure — is
+    written to ``WebhookDeliveryLog``.  After all 5 retries are exhausted the
+    subscription is marked ``suspended`` and ``is_active`` set to ``False`` so
+    it is excluded from future dispatches.
+
+    HMAC signing
+    ~~~~~~~~~~~~
+    Every request carries ``X-SoroScan-Signature: sha256=<hmac_hex>`` where
+    the HMAC is computed over the JSON-serialised (sorted-keys) event payload
+    using the subscription's secret.  The secret is never logged.
 
     Args:
-        event_data: The event payload to send
-        webhook_id: ID of the WebhookSubscription
+        subscription_id: PK of the ``WebhookSubscription`` to deliver to.
+        event_id: PK of the ``ContractEvent`` being delivered.
 
     Returns:
-        True if successful, False otherwise
+        ``True`` on successful delivery, ``False`` when the subscription is
+        absent/inactive (no retry in that case).
     """
+    # ------------------------------------------------------------------ #
+    # 1. Fetch subscription — skip silently if gone / inactive / suspended #
+    # ------------------------------------------------------------------ #
     try:
-        webhook = WebhookSubscription.objects.get(id=webhook_id, is_active=True)
+        webhook = WebhookSubscription.objects.get(
+            id=subscription_id,
+            is_active=True,
+            status=WebhookSubscription.STATUS_ACTIVE,
+        )
     except WebhookSubscription.DoesNotExist:
         logger.warning(
-            "Webhook %s not found or inactive",
-            webhook_id,
-            extra={"webhook_id": webhook_id},
+            "Webhook subscription %s not found, inactive, or suspended — skipping",
+            subscription_id,
+            extra={"webhook_id": subscription_id},
         )
         return False
 
-    # Generate HMAC signature
-    payload_str = str(event_data).encode("utf-8")
-    signature = hmac.new(
+    # ------------------------------------------------------------------ #
+    # 2. Fetch event                                                        #
+    # ------------------------------------------------------------------ #
+    try:
+        event = ContractEvent.objects.select_related("contract").get(id=event_id)
+    except ContractEvent.DoesNotExist:
+        logger.warning(
+            "ContractEvent %s not found — skipping dispatch for subscription %s",
+            event_id,
+            subscription_id,
+            extra={"event_id": event_id, "webhook_id": subscription_id},
+        )
+        return False
+
+    # ------------------------------------------------------------------ #
+    # 3. Build payload & HMAC-SHA256 signature                             #
+    # ------------------------------------------------------------------ #
+    event_data = {
+        "contract_id": event.contract.contract_id,
+        "event_type": event.event_type,
+        "payload": event.payload,
+        "ledger": event.ledger,
+        "event_index": event.event_index,
+        "tx_hash": event.tx_hash,
+    }
+    payload_bytes = json.dumps(event_data, sort_keys=True).encode("utf-8")
+    sig_hex = hmac.new(
         webhook.secret.encode("utf-8"),
-        msg=payload_str,
+        msg=payload_bytes,
         digestmod=hashlib.sha256,
     ).hexdigest()
 
     headers = {
         "Content-Type": "application/json",
-        "X-SoroScan-Signature": signature,
-        "X-SoroScan-Timestamp": datetime.utcnow().isoformat(),
+        "X-SoroScan-Signature": f"sha256={sig_hex}",
+        "X-SoroScan-Timestamp": timezone.now().isoformat(),
     }
 
+    attempt_number = self.request.retries + 1
+    attempt_logged = False  # guard against double-logging
+
+    # ------------------------------------------------------------------ #
+    # 4. Deliver                                                           #
+    # ------------------------------------------------------------------ #
     try:
         response = requests.post(
             webhook.target_url,
-            json=event_data,
+            data=payload_bytes,
             headers=headers,
             timeout=10,
         )
-        response.raise_for_status()
+        status_code = response.status_code
 
-        # Update success state
-        webhook.last_triggered = timezone.now()
-        webhook.failure_count = 0
-        webhook.save(update_fields=["last_triggered", "failure_count"])
+        # -- 429: respect Retry-After header, then retry ---------------
+        if status_code == 429:
+            error_msg = "Rate limited by subscriber (429)"
+            _log_delivery_attempt(webhook, event, attempt_number, status_code, False, error_msg)
+            attempt_logged = True
+            _on_delivery_failure(webhook, self)
 
-        contract_id = event_data.get("contract_id")
-        logger.info(
-            "Webhook %s delivered successfully",
-            webhook_id,
-            extra={"webhook_id": webhook_id, "contract_id": contract_id},
-        )
-        return True
+            countdown: int | None = None
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    countdown = int(retry_after)
+                except (ValueError, TypeError):
+                    pass
+
+            raise self.retry(
+                exc=requests.HTTPError("Rate limited (429)", response=response),
+                countdown=countdown,
+            )
+
+        # -- 2xx: success (treat any 2xx as success, even malformed body) --
+        success = 200 <= status_code < 300
+        error_msg = "" if success else f"HTTP {status_code}"
+
+        _log_delivery_attempt(webhook, event, attempt_number, status_code, success, error_msg)
+        attempt_logged = True
+
+        if success:
+            WebhookSubscription.objects.filter(pk=webhook.pk).update(
+                failure_count=0,
+                last_triggered=timezone.now(),
+            )
+            logger.info(
+                "Webhook %s delivered successfully (attempt %s)",
+                subscription_id,
+                attempt_number,
+                extra={"webhook_id": subscription_id},
+            )
+            return True
+
+        # -- non-2xx, non-429: raise to trigger autoretry ---------------
+        _on_delivery_failure(webhook, self)
+        response.raise_for_status()  # raises HTTPError → caught by autoretry_for
 
     except requests.RequestException as exc:
-        # Update failure count
-        webhook.failure_count += 1
-        webhook.save(update_fields=["failure_count"])
-        contract_id = event_data.get("contract_id")
-
-        # Disable webhook after too many failures
-        if webhook.failure_count >= 10:
-            webhook.is_active = False
-            webhook.save(update_fields=["is_active"])
-            logger.error(
-                "Webhook %s disabled after %s failures",
-                webhook_id,
-                webhook.failure_count,
-                extra={"webhook_id": webhook_id, "contract_id": contract_id},
-            )
-            return False
+        # Network-level error (timeout, connection refused, etc.) only reaches
+        # here when raise_for_status() fires AND attempt was already logged, OR
+        # for genuine network errors.  The attempt_logged flag prevents
+        # duplicate records.
+        if not attempt_logged:
+            _log_delivery_attempt(webhook, event, attempt_number, None, False, str(exc))
+            _on_delivery_failure(webhook, self)
 
         logger.warning(
-            "Webhook %s failed, retrying: %s",
-            webhook_id,
+            "Webhook %s dispatch failed (attempt %s/%s): %s",
+            subscription_id,
+            attempt_number,
+            self.max_retries + 1,
             exc,
-            extra={"webhook_id": webhook_id, "contract_id": contract_id},
+            extra={"webhook_id": subscription_id},
         )
-        raise self.retry(exc=exc)
+        raise  # re-raise so autoretry_for can schedule the next attempt
+
+    return False  # unreachable — satisfies type checker
+
+
+# ---------------------------------------------------------------------------
+# Private helpers for dispatch_webhook
+# ---------------------------------------------------------------------------
+
+def _log_delivery_attempt(
+    webhook: WebhookSubscription,
+    event: ContractEvent,
+    attempt_number: int,
+    status_code: int | None,
+    success: bool,
+    error: str,
+) -> None:
+    """Create a ``WebhookDeliveryLog`` record for one dispatch attempt."""
+    from .models import WebhookDeliveryLog
+
+    WebhookDeliveryLog.objects.create(
+        subscription=webhook,
+        event=event,
+        attempt_number=attempt_number,
+        status_code=status_code,
+        success=success,
+        error=error,
+    )
+
+
+def _on_delivery_failure(
+    webhook: WebhookSubscription,
+    task_instance,
+) -> None:
+    """
+    Atomically increment ``failure_count`` and, when all retries are exhausted,
+    mark the subscription as ``suspended`` + ``is_active=False``.
+    """
+    WebhookSubscription.objects.filter(pk=webhook.pk).update(
+        failure_count=F("failure_count") + 1,
+    )
+
+    is_last_attempt = task_instance.request.retries >= task_instance.max_retries
+    if is_last_attempt:
+        WebhookSubscription.objects.filter(pk=webhook.pk).update(
+            status=WebhookSubscription.STATUS_SUSPENDED,
+            is_active=False,
+        )
+        logger.error(
+            "Webhook subscription %s suspended after %d consecutive failures",
+            webhook.id,
+            task_instance.max_retries + 1,
+            extra={"webhook_id": webhook.id},
+        )
+
+
+@shared_task
+def cleanup_webhook_delivery_logs() -> int:
+    """
+    Prune ``WebhookDeliveryLog`` entries older than 30 days (TTL cleanup).
+
+    Schedule via Celery Beat, e.g. daily.  Returns the number of deleted rows.
+    """
+    from .models import WebhookDeliveryLog
+
+    cutoff = timezone.now() - timedelta(days=30)
+    deleted_count, _ = WebhookDeliveryLog.objects.filter(timestamp__lt=cutoff).delete()
+    logger.info(
+        "Pruned %d WebhookDeliveryLog entries older than 30 days",
+        deleted_count,
+        extra={},
+    )
+    return deleted_count
 
 
 @shared_task
@@ -245,22 +402,62 @@ def process_new_event(event_data: dict[str, Any]) -> None:
                 extra={"contract_id": contract_id},
             )
 
-    # Find matching webhooks
+    # Find matching active (non-suspended) webhooks
     webhooks = WebhookSubscription.objects.filter(
         contract__contract_id=contract_id,
         is_active=True,
+        status=WebhookSubscription.STATUS_ACTIVE,
     ).filter(
         # Match specific event type or all events (blank event_type)
         event_type__in=[event_type, ""]
     )
 
+    if not webhooks.exists():
+        logger.info(
+            "No active webhooks for contract %s event_type %s",
+            contract_id,
+            event_type,
+            extra={"contract_id": contract_id},
+        )
+        return
+
+    # Resolve the ContractEvent DB row so dispatch_webhook receives its PK
+    ledger = event_data.get("ledger")
+    event_index = event_data.get("event_index", 0)
+    event_obj = None
+    if ledger is not None:
+        try:
+            event_obj = ContractEvent.objects.get(
+                contract__contract_id=contract_id,
+                ledger=ledger,
+                event_index=event_index,
+            )
+        except ContractEvent.DoesNotExist:
+            logger.warning(
+                "ContractEvent not found for contract=%s ledger=%s index=%s — skipping webhook dispatch",
+                contract_id,
+                ledger,
+                event_index,
+                extra={"contract_id": contract_id},
+            )
+            return
+
+    if event_obj is None:
+        logger.warning(
+            "No ledger/event_index in event_data — cannot dispatch webhooks",
+            extra={"contract_id": contract_id},
+        )
+        return
+
     # Dispatch to all matching webhooks
+    dispatched = 0
     for webhook in webhooks:
-        dispatch_webhook.delay(event_data, webhook.id)
+        dispatch_webhook.delay(webhook.id, event_obj.id)
+        dispatched += 1
 
     logger.info(
         "Dispatched event to %s webhooks",
-        webhooks.count(),
+        dispatched,
         extra={"contract_id": contract_id},
     )
 

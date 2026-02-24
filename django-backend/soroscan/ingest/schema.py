@@ -5,10 +5,11 @@ from __future__ import annotations
 import base64
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import AsyncGenerator, Optional
 
 import strawberry
 import strawberry_django
+from channels.layers import get_channel_layer
 from strawberry import auto
 from strawberry.types import Info
 
@@ -339,4 +340,60 @@ class Mutation:
         return contract
 
 
-schema = strawberry.Schema(query=Query, mutation=Mutation)
+@strawberry.type
+class Subscription:
+    @strawberry.subscription
+    async def contract_events(
+        self, info: Info, contract_id: str
+    ) -> AsyncGenerator[EventType, None]:
+        """
+        Subscribe to real-time events for a specific contract.
+        
+        Args:
+            contract_id: The contract ID to subscribe to
+            
+        Yields:
+            EventType: Real-time contract events as they occur
+        """
+        from channels.db import database_sync_to_async
+        
+        channel_layer = get_channel_layer()
+        if not channel_layer:
+            # If no channel layer, exit gracefully
+            return
+            
+        channel_name = await channel_layer.new_channel()
+        group_name = f"events_{contract_id}"
+        
+        await channel_layer.group_add(group_name, channel_name)
+        
+        try:
+            while True:
+                message = await channel_layer.receive(channel_name)
+                event_data = message.get("data", {})
+                
+                # Create EventType from the message data
+                try:
+                    # Fetch the actual event from database to get proper EventType instance
+                    @database_sync_to_async
+                    def get_event():
+                        return ContractEvent.objects.select_related("contract").get(
+                            contract__contract_id=event_data.get("contract_id"),
+                            ledger=event_data.get("ledger"),
+                            event_index=event_data.get("event_index", 0)
+                        )
+                    
+                    event = await get_event()
+                    yield event
+                except ContractEvent.DoesNotExist:
+                    # If event not found, skip this message
+                    continue
+                except Exception:
+                    # Skip any other errors and continue listening
+                    continue
+                    
+        finally:
+            await channel_layer.group_discard(group_name, channel_name)
+
+
+schema = strawberry.Schema(query=Query, mutation=Mutation, subscription=Subscription)

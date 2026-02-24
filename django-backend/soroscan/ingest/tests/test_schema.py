@@ -49,6 +49,29 @@ class TestGraphQLQueries:
         assert len(result.data["contracts"]) == 1
         assert result.data["contracts"][0]["isActive"] is True
 
+    def test_schema_has_subscription_type(self):
+        """Test that the schema includes subscription type."""
+        # Verify the schema has a subscription type
+        assert schema.subscription is not None
+        
+        # Verify subscription operations can be introspected
+        introspection_query = """
+            query {
+                __schema {
+                    subscriptionType {
+                        name
+                        fields {
+                            name
+                        }
+                    }
+                }
+            }
+        """
+        result = schema.execute_sync(introspection_query)
+        assert result.errors is None
+        assert result.data["__schema"]["subscriptionType"] is not None
+        assert result.data["__schema"]["subscriptionType"]["name"] == "Subscription"
+
     def test_query_contract_by_id(self, contract):
         query = f"""
             query {{

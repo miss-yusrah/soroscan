@@ -123,7 +123,7 @@ class ContractEventViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = ContractEvent.objects.all()
     serializer_class = ContractEventSerializer
     filter_backends = [DjangoFilterBackend, OrderingFilter]
-    filterset_fields = ["contract__contract_id", "event_type", "ledger", "validation_status"]
+    filterset_fields = ["contract__contract_id", "event_type", "ledger", "validation_status", "decoding_status"]
     ordering_fields = ["timestamp", "ledger"]
     ordering = ["-timestamp"]
 

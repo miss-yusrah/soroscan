@@ -11,6 +11,10 @@ type Mutation {
   refreshToken(refresh: String!): AuthPayload!
 }
 
+type Subscription {
+  contractEvent(contractId: String!): ContractEvent!
+}
+
 type AuthPayload {
   access: String!
   refresh: String!
@@ -36,4 +40,12 @@ type Event {
   eventType: String!
   data: String!
   createdAt: String!
+}
+
+type ContractEvent {
+  id: ID!
+  eventType: String!
+  ledgerSequence: Int!
+  timestamp: String!
+  payload: String!
 }

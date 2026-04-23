@@ -604,7 +604,6 @@ class WebhookSubscription(models.Model):
         # Auto-generate secret if not set
         if not self.secret:
             self.secret = secrets.token_hex(32)
-        self.clean()
         super().save(*args, **kwargs)
 
 
